@@ -1278,6 +1278,7 @@ static inline void sec_slot_cleanup_if_unusable(void)
 #endif /* defined(CONFIG_MCUBOOT_CLEANUP_UNUSABLE_SECONDARY) &&\
           defined(PM_S1_ADDRESS) || defined(CONFIG_SOC_NRF5340_CPUAPP) */
 
+
 /**
  * Determines which swap operation to perform, if any.  If it is determined
  * that a swap operation is required, the image in the secondary slot is checked
@@ -1319,6 +1320,47 @@ boot_validated_swap_type(struct boot_loader_state *state,
             return BOOT_SWAP_TYPE_FAIL;
         }
 
+		//Tekuma edit
+		if(IS_ENCRYPTED(hdr)){	
+
+            #if defined(MCUBOOT_ENC_IMAGES)
+
+                uint8_t image_index = BOOT_CURR_IMG(state);
+                
+                rc = boot_enc_load(BOOT_CURR_ENC(state),image_index,hdr,secondary_fa,bs);
+                if (rc < 0) {
+                    BOOT_LOG_DBG("Failed to find required encryption key");
+                    return BOOT_SWAP_TYPE_FAIL;
+                }
+                if (rc == 0 && boot_enc_set_key(BOOT_CURR_ENC(state), BOOT_SECONDARY_SLOT, bs)){
+                    BOOT_LOG_DBG("Failed to load required encryption key");
+                    return BOOT_SWAP_TYPE_FAIL;
+                }
+                else{
+                    
+                    //this is absolutely smaller than the largest chunk so we don't need to check?
+                    uint32_t tmp_buf[8/4]; 
+                    
+                    rc = flash_area_read(secondary_fa, hdr->ih_hdr_size,
+                                &tmp_buf,8);
+
+                    //I don't fully understand how this function works.
+                    //I have struggled to find any documentation on this function. I got this working from reverse engineering so this might break later
+                    //Originally I was passing a full 512 byte array but just passing the first 8 bytes of data then reading it seems to work
+                    //need to test with other encryption standards, tested with ECDSA_P256
+                    boot_encrypt(BOOT_CURR_ENC(state), image_index, 
+                                    secondary_fa, 0, 8,
+                                    0, (uint8_t*)tmp_buf);
+                    reset_addr = tmp_buf[1];              
+                }
+
+            #else
+                BOOT_LOG_DBG("Encryption images are not supported");
+                return BOOT_SWAP_TYPE_FAIL;
+            #endif //end MCUBOOT_ENC_IMAGES
+		}
+		//end Tekuma edit 
+        
         sec_slot_touch(state);
 
 #ifdef PM_S1_ADDRESS
@@ -1401,6 +1443,127 @@ boot_validated_swap_type(struct boot_loader_state *state,
             uint32_t vtable_addr = (uint32_t)hdr + hdr->ih_hdr_size;
             uint32_t *net_core_fw_addr = (uint32_t *)(vtable_addr);
             uint32_t fw_size = hdr->ih_img_size;
+
+            //Tekuma Edit
+            uint32_t totalSize = (hdr->ih_hdr_size + fw_size);
+
+            uint8_t clr_img_aft_update = 0;
+
+            uint8_t image_index = BOOT_CURR_IMG(state);
+
+            if(IS_ENCRYPTED(hdr)){	
+                #if defined(MCUBOOT_ENC_IMAGES)
+                /* since the network core reads off the flash we need to decrypt the image in place
+                *  for this reason we want to clear the image after since we no longer need it and want minimal decrypted data on the SoC
+                *  in the event of and error this might allow us to recover from a bad flash?
+                */
+                clr_img_aft_update = 1; 
+                
+                rc = flash_area_open(flash_area_id_from_multi_image_slot(
+                                 BOOT_CURR_IMG(state), BOOT_SECONDARY_SLOT),
+                                    &secondary_fa);
+                if(rc){
+                    BOOT_LOG_ERR("Error %d opening flash, will try anyway", rc);
+                    rc=0;
+                }
+
+                //try loading the keys just in case we don't have them already
+                rc = boot_enc_load(BOOT_CURR_ENC(state),image_index,hdr,secondary_fa,bs);
+                if (rc < 0) {
+                    BOOT_LOG_ERR("Failed to find required encryption key, Error code: %d", rc);
+                    return BOOT_SWAP_TYPE_FAIL;
+                }
+                if (rc == 0 && boot_enc_set_key(BOOT_CURR_ENC(state), BOOT_SECONDARY_SLOT, bs)){
+                    BOOT_LOG_ERR("Failed to load required encryption key, Error code: %d", rc);
+                    return BOOT_SWAP_TYPE_FAIL;
+                }
+                else{
+                    BOOT_LOG_DBG("Key already loaded");
+                    rc = 0;
+                }
+
+                //we can't erase small chunks so this needs to be done by sectores
+                uint32_t sect_count = boot_img_num_sectors(state, BOOT_SECONDARY_SLOT);
+                uint32_t secSize, sect, off;
+                uint32_t encStart = hdr->ih_hdr_size; 
+                uint32_t encEnd = 0;
+
+                BOOT_LOG_INF("Decrytping network core image of size %06x", fw_size); 
+
+                for (sect = 0, off = 0; (sect < sect_count && off < totalSize) && !rc; sect++, off += secSize) {
+                    secSize = boot_img_sector_size(state, BOOT_SECONDARY_SLOT, sect);
+                    uint8_t temp_buf[secSize] __attribute__((aligned(4)));
+
+                    rc = flash_area_read(secondary_fa, off,
+                                temp_buf,secSize);
+
+                    if(rc){
+                        BOOT_LOG_ERR("Cannot read flash, Error: %d", rc);
+                    }
+                    else{
+
+                        if(!encEnd){
+
+                            uint32_t toDecSize = secSize-encStart;
+                            //if the image ends in this sector then stop decrypting before we hit the tail
+                            //Only the payload is encrypted
+                            if(off > totalSize-secSize){
+                                encEnd = totalSize-off;
+                                toDecSize = encEnd;
+                            }
+                        
+                            BOOT_LOG_DBG("decrytping image at 0x%08x, with size %d", off+encStart, toDecSize);  
+
+                            /* we need to set the offset of the data that's being decrypted,
+                            *  in the beginning we need to offset the start of the data to
+                            *  be passed by encStart but we don't want this to effect the
+                            *  off value so we add that to that value. When the clear encStart
+                            *  since the remaining sectors start with data to decode but we
+                            *  must ensure that the off value takes into consideration the
+                            *  header packet so we offset it with hdr->ih_hdr_size
+                            */
+
+                            boot_encrypt(BOOT_CURR_ENC(state), image_index, 
+                                            secondary_fa, off-hdr->ih_hdr_size + encStart, toDecSize,
+                                            0, &(temp_buf[encStart]));
+                        
+                            //if encStart has a value, delete it since we only need it at the start
+                            if(encStart){
+                                encStart=0;
+                            }
+                        }
+                        
+                        //clear the ecrypted sector
+                        rc = flash_area_erase(secondary_fa, off, secSize); 
+                        if(rc){
+                            BOOT_LOG_ERR("Cannot erase flash, Error: %d", rc);
+                        }
+                        else{
+                            //write the decrypted data back to the sector
+                            rc = flash_area_write(secondary_fa, off,
+                                        temp_buf,secSize);
+                            if(rc){
+                                BOOT_LOG_ERR("Cannot write flash, Error: %d", rc);
+                            }
+                            
+                        }
+                        
+                        
+                    }
+                }
+
+                if(rc){
+                    BOOT_LOG_ERR("Error %d occured while decrypting the image",rc);
+                    return BOOT_SWAP_TYPE_FAIL;
+                }
+                #else 
+                    BOOT_LOG_DBG("Encrypted images are not supported");
+                    //break before we start trying to update the network core, if we don't, we will brick the network core 
+                    return BOOT_SWAP_TYPE_FAIL;
+                #endif //end MCUBOOT_ENC_IMAGES
+            }
+            //End Tekuma Edit
+
             BOOT_LOG_INF("Starting network core update");
             rc = pcd_network_core_update(net_core_fw_addr, fw_size);
 
@@ -1418,6 +1581,72 @@ boot_validated_swap_type(struct boot_loader_state *state,
 #endif
                 swap_type = BOOT_SWAP_TYPE_NONE;
             }
+            //Tekuma Edit
+
+            //While the above is true in most cases, if clr_img_aft_update it not 0, we want to clear the sector
+            //if clr_img_aft_update is set we clear the image regardless of rc value
+            if(clr_img_aft_update){
+
+                BOOT_LOG_INF("Erasing leftover image");
+
+                //the above does not do this in the event of the network core not updating
+                //I want to do this so we can recover the network
+                #if defined(MCUBOOT_SWAP_USING_SCRATCH) || defined(MCUBOOT_SWAP_USING_MOVE)
+                    /* swap_erase_trailer_sectors is undefined if upgrade only
+                    * method is used. There is no need to erase sectors, because
+                    * the image cannot be reverted.
+                    */
+                    rc = swap_erase_trailer_sectors(state,
+                            secondary_fa);
+                #endif
+
+                //assuming the secondary slot
+                rc = flash_area_open(flash_area_id_from_multi_image_slot(
+                                 BOOT_CURR_IMG(state), BOOT_SECONDARY_SLOT),
+                                    &secondary_fa);
+                if(rc){
+                    BOOT_LOG_ERR("Error %d opening flash, will try anyway", rc);
+                    rc=0;
+                }
+
+                uint32_t sect_count = boot_img_num_sectors(state, BOOT_SECONDARY_SLOT);
+                uint32_t this_size;
+                uint32_t  sect, off;
+
+                //We need to know the TLV sector size so we can clear that too
+                struct image_tlv_info info;
+                uint32_t tlv_off_test = BOOT_TLV_OFF(hdr);
+
+                if (flash_area_read(secondary_fa, tlv_off_test, &info, sizeof(info))) {
+                    BOOT_LOG_ERR("Error %d whlie reading flash during erase ", rc);
+                }
+                else{
+                    totalSize += info.it_tlv_tot;
+                }
+
+
+                //now we know the size of the image, clear it
+                BOOT_LOG_INF("Clearing image file of size %d",totalSize);
+
+                //got this from code inboot_copy_image, modifed for my needs and to exit out of the loop if and error occurs 
+                for (sect = 0, off = 0; (sect < sect_count && off < totalSize) && !rc; sect++) {
+                    
+                    this_size = boot_img_sector_size(state, BOOT_SECONDARY_SLOT, sect);
+                    BOOT_LOG_DBG("Erasing sector %d of %d", sect,sect_count);
+                    rc = boot_erase_region(secondary_fa, off, this_size);
+                    off += this_size;
+                }
+                if(rc){
+                    BOOT_LOG_ERR("Error %d whlie erasing block sector %d", rc, sect);
+                }
+                else if(sect < sect_count){
+                    BOOT_LOG_DBG("Remaining sectors don't need to be cleared as they are already blank");
+                }
+                //This might do something, it might note, should still add it?
+                flash_area_close(secondary_fa);
+                
+            }
+            //End Tekuma edit
         }
 #endif /* CONFIG_SOC_NRF5340_CPUAPP && PM_CPUNET_B0N_ADDRESS &&
 	  !CONFIG_NRF53_MULTI_IMAGE_UPDATE && CONFIG_PCD_APP */
